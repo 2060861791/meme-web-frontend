@@ -1,0 +1,68 @@
+name: Deploy Vue3 Frontend
+
+on:
+  push:
+    branches:
+      - main # 监听 main 分支的 push 事件
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest # GitHub 提供的 Ubuntu 服务器
+
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v3
+
+      - name: 🐳 构建 Docker 镜像（优化缓存）
+        run: |
+          IMAGE_NAME=$(echo "${{ secrets.DOCKER_IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          DOCKER_BUILDKIT=1 docker build --rm \
+            --cache-from $IMAGE_NAME \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t $IMAGE_NAME .
+
+      - name: 🎁 导出并压缩 Docker 镜像
+        run: |
+          IMAGE_NAME=$(echo "${{ secrets.DOCKER_IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker save $IMAGE_NAME | gzip > vue-app.tar.gz
+          chmod 644 vue-app.tar.gz
+          echo "📊 压缩后Docker镜像大小:"
+          ls -lh vue-app.tar.gz | awk '{print $5}'
+
+      - name: 📤 上传压缩包到服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "vue-app.tar.gz"
+          target: "/home/${{ secrets.SSH_USER }}/"
+          timeout: 1000s
+          strip_components: 0
+          overwrite: true
+          debug: true
+
+      - name: 🚀 在服务器上加载并运行镜像
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            IMAGE_NAME=$(echo "${{ secrets.DOCKER_IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+            cd /home/${{ secrets.SSH_USER }}
+
+            # 解压并加载镜像
+            gunzip -c vue-app.tar.gz | sudo docker load
+            rm -f vue-app.tar.gz
+
+            # 释放占用的 8080 端口（仅当容器未正常释放时）
+            sudo docker stop vue-app || echo "Container vue-app not running."
+            sudo docker rm vue-app || echo "Container vue-app does not exist."
+            sudo fuser -k 8080/tcp || echo "No process using 8080"
+
+            # 清理未使用的旧 Docker 镜像（防止存储占用过多）
+            sudo docker image prune -f --filter "label=app=vue-app"
+
+            # 运行新容器
+            sudo docker run -d --restart always -p 8080:80 --name vue-app $IMAGE_NAME
